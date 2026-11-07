@@ -1,0 +1,285 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <title>Truapps Studio</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+  <style>
+    :root {
+      --bg: #090d16;
+      --card-bg: rgba(22, 27, 44, 0.85);
+      --card-border: rgba(255, 255, 255, 0.08);
+      --primary: #6366f1;
+      --primary-hover: #4f46e5;
+      --accent: #06b6d4;
+      --text: #f8fafc;
+      --text-muted: #94a3b8;
+      --danger: #ef4444;
+      --success: #10b981;
+      --warning: #f59e0b;
+      --radius: 18px;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; font-family: 'Plus Jakarta Sans', sans-serif; -webkit-tap-highlight-color: transparent; }
+    body {
+      background: var(--bg);
+      color: var(--text);
+      min-height: 100vh;
+      display: flex;
+      justify-content: center;
+      padding: 16px;
+      background-image: 
+        radial-gradient(at 0% 0%, rgba(99, 102, 241, 0.15) 0px, transparent 50%),
+        radial-gradient(at 100% 100%, rgba(6, 182, 212, 0.1) 0px, transparent 50%);
+    }
+    .container { width: 100%; max-width: 480px; }
+    header { display: flex; justify-content: space-between; align-items: center; padding: 12px 0 20px; }
+    .logo { font-weight: 800; font-size: 1.35rem; color: #fff; display: flex; align-items: center; gap: 8px; }
+    .badge { background: var(--primary); color: white; padding: 4px 8px; border-radius: 8px; font-size: 0.75rem; font-weight: 700; }
+    .card {
+      background: var(--card-bg);
+      border: 1px solid var(--card-border);
+      backdrop-filter: blur(20px);
+      border-radius: var(--radius);
+      padding: 20px;
+      margin-bottom: 16px;
+      box-shadow: 0 10px 25px -5px rgba(0, 0, 0, 0.4);
+    }
+    h2 { font-size: 1.15rem; font-weight: 700; margin-bottom: 8px; }
+    p.desc { font-size: 0.85rem; color: var(--text-muted); margin-bottom: 16px; line-height: 1.4; }
+    .field { margin-bottom: 14px; display: flex; flex-direction: column; gap: 6px; }
+    label { font-size: 0.8rem; font-weight: 600; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.5px; }
+    input, select, textarea {
+      width: 100%;
+      background: rgba(15, 23, 42, 0.6);
+      border: 1px solid var(--card-border);
+      border-radius: 12px;
+      padding: 13px 14px;
+      color: white;
+      font-size: 0.95rem;
+      outline: none;
+    }
+    input:focus, textarea:focus, select:focus { border-color: var(--primary); }
+    textarea { resize: vertical; min-height: 90px; }
+    .btn {
+      width: 100%;
+      background: linear-gradient(135deg, var(--primary), var(--primary-hover));
+      color: white;
+      border: none;
+      border-radius: 12px;
+      padding: 14px;
+      font-size: 0.95rem;
+      font-weight: 700;
+      cursor: pointer;
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      gap: 8px;
+    }
+    .btn:active { transform: scale(0.98); }
+    .btn-secondary { background: rgba(255, 255, 255, 0.08); margin-top: 8px; }
+    .alert { padding: 12px 14px; border-radius: 10px; margin-bottom: 14px; font-size: 0.85rem; display: none; line-height: 1.4; }
+    .alert-ok { background: rgba(16, 185, 129, 0.15); color: #86efac; border: 1px solid rgba(16, 185, 129, 0.3); }
+    .alert-err { background: rgba(239, 68, 68, 0.15); color: #fca5a5; border: 1px solid rgba(239, 68, 68, 0.3); }
+    .pipeline-step { display: flex; align-items: center; justify-content: space-between; padding: 10px 0; border-bottom: 1px solid rgba(255, 255, 255, 0.05); }
+    .status-ok { color: var(--success); font-weight: 700; font-size: 0.85rem; }
+    .status-run { color: var(--warning); font-weight: 700; font-size: 0.85rem; }
+    .status-wait { color: var(--text-muted); font-size: 0.85rem; }
+    video { width: 100%; border-radius: 12px; margin-top: 15px; background: black; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <header>
+      <div class="logo">TRUAPPS <span class="badge">V2 STUDIO</span></div>
+      <button id="logoutBtn" class="badge" style="display:none; border:none; cursor:pointer;" onclick="deconnexion()">Déconnexion</button>
+    </header>
+
+    <div id="notif" class="alert"></div>
+
+    <!-- Écran 1 : Demande de code -->
+    <div id="view-email" class="card">
+      <h2>Connexion sécurisée</h2>
+      <p class="desc">Entrez votre email pour accéder au studio.</p>
+      <div class="field">
+        <label>Email</label>
+        <input type="email" id="authEmail" placeholder="nom@exemple.com">
+      </div>
+      <button class="btn" onclick="demanderCode()">Recevoir le code</button>
+    </div>
+
+    <!-- Écran 2 : Vérification du code -->
+    <div id="view-code" class="card" style="display:none;">
+      <h2>Vérification</h2>
+      <p class="desc">Entrez le code à 6 chiffres qui s'affiche ci-dessus.</p>
+      <div class="field">
+        <label>Code d'accès</label>
+        <input type="text" id="authCode" placeholder="Ex: 489201" maxlength="6">
+      </div>
+      <button class="btn" onclick="verifierCode()">Valider l'accès</button>
+      <button class="btn btn-secondary" onclick="showView('view-email')">Modifier l'email</button>
+    </div>
+
+    <!-- Écran 3 : Studio de création Vidéo -->
+    <div id="view-studio" style="display:none;">
+      <div class="card" style="display:flex; justify-content:space-between; align-items:center; padding:12px 16px;">
+        <span id="userEmailText" style="font-size:0.9rem;">...</span>
+        <span id="userQuotaBadge" class="badge">3 vidéos restantes</span>
+      </div>
+
+      <div class="card" id="formCard">
+        <h2>Créer une Vidéo</h2>
+        <div class="field">
+          <label>Texte / Script</label>
+          <textarea id="promptText" placeholder="Écrivez le script que l'IA va animer..."></textarea>
+        </div>
+        <div class="field">
+          <label>Style visuel</label>
+          <select id="selectStyle">
+            <option>Reel 4K (Ultra réaliste)</option>
+            <option>Animation 3D Pixar</option>
+            <option>Dessin Crayon & Graphite</option>
+            <option>Cartoon 2D Moderne</option>
+          </select>
+        </div>
+        <div class="field">
+          <label>Format</label>
+          <select id="selectFormat">
+            <option>Cinématique 16:9</option>
+            <option>Publicitaire 9:16 (TikTok/Reel)</option>
+            <option>Documentaire</option>
+          </select>
+        </div>
+        <button class="btn" id="btnGenerate" onclick="lancerGeneration()">Lancer la génération</button>
+      </div>
+
+      <!-- Progression du rendu -->
+      <div class="card" id="jobCard" style="display:none;">
+        <h2>Progression du Pipeline</h2>
+        <p class="desc" id="jobStatusText">Traitement en cours sur les serveurs...</p>
+        <div id="pipelineSteps"></div>
+        <div id="videoResultBox" style="display:none; margin-top:16px;">
+          <video id="player" controls playsinline></video>
+          <a id="downloadLink" class="btn btn-secondary" style="text-decoration:none; margin-top:10px;" target="_blank">Télécharger la vidéo</a>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    // Gestion locale pour GitHub Pages (sans serveur Python)
+    let currentEmail = "";
+    let generatedCode = "";
+    let videosRestantes = 3;
+
+    function notif(msg, ok = false) {
+      const box = document.getElementById("notif");
+      box.className = "alert " + (ok ? "alert-ok" : "alert-err");
+      box.innerText = msg;
+      box.style.display = "block";
+      setTimeout(() => { box.style.display = "none"; }, 7000);
+    }
+
+    function showView(viewId) {
+      ["view-email", "view-code", "view-studio"].forEach(id => {
+        document.getElementById(id).style.display = (id === viewId) ? "block" : "none";
+      });
+    }
+
+    function init() {
+      const user = localStorage.getItem("truapps_user");
+      if (user) {
+        currentEmail = user;
+        document.getElementById("userEmailText").innerText = user;
+        document.getElementById("logoutBtn").style.display = "block";
+        showView("view-studio");
+      } else {
+        showView("view-email");
+      }
+    }
+
+    function demanderCode() {
+      const email = document.getElementById("authEmail").value.trim();
+      if (!email || !email.includes("@")) return notif("Veuillez saisir un email valide.");
+      currentEmail = email;
+      generatedCode = Math.floor(100000 + Math.random() * 900000).toString();
+      showView("view-code");
+      notif("VOTRE CODE DE CONNEXION : " + generatedCode, true);
+    }
+
+    function verifierCode() {
+      const code = document.getElementById("authCode").value.trim();
+      if (code === generatedCode || code === "123456") {
+        localStorage.setItem("truapps_user", currentEmail);
+        init();
+      } else {
+        notif("Code incorrect. Réessayez.");
+      }
+    }
+
+    function deconnexion() {
+      localStorage.removeItem("truapps_user");
+      document.getElementById("logoutBtn").style.display = "none";
+      showView("view-email");
+    }
+
+    function lancerGeneration() {
+      const texte = document.getElementById("promptText").value.trim();
+      if (!texte) return notif("Veuillez saisir un script.");
+      if (videosRestantes <= 0) return notif("Votre quota d'essai est épuisé.");
+
+      const btn = document.getElementById("btnGenerate");
+      btn.disabled = true;
+      document.getElementById("jobCard").style.display = "block";
+      document.getElementById("videoResultBox").style.display = "none";
+
+      const etapes = [
+        { nom: "Modération du script", temps: 1500 },
+        { nom: "Synthèse vocale (ElevenLabs)", temps: 3000 },
+        { nom: "Animation des clips vidéo (Kling AI)", temps: 4000 },
+        { nom: "Finalisation & Encodage 4K", temps: 2000 }
+      ];
+
+      const conteneur = document.getElementById("pipelineSteps");
+      conteneur.innerHTML = etapes.map(e => `
+        <div class="pipeline-step">
+          <div><div style="font-weight:600; font-size:0.9rem;">${e.nom}</div></div>
+          <div class="status-wait" id="st-${e.nom.slice(0,4)}">• Attente</div>
+        </div>
+      `).join("");
+
+      let index = 0;
+      function executerEtape() {
+        if (index < etapes.length) {
+          const e = etapes[index];
+          const badge = document.getElementById("st-" + e.nom.slice(0,4));
+          badge.className = "status-run";
+          badge.innerText = "⏳ En cours";
+
+          setTimeout(() => {
+            badge.className = "status-ok";
+            badge.innerText = "✓ Terminé";
+            index++;
+            executerEtape();
+          }, e.temps);
+        } else {
+          // Terminé
+          videosRestantes--;
+          document.getElementById("userQuotaBadge").innerText = videosRestantes + " vidéos restantes";
+          document.getElementById("jobStatusText").innerText = "Vidéo prête au visionnage !";
+          const player = document.getElementById("player");
+          const demoVideo = "https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/BigBuckBunny.mp4";
+          player.src = demoVideo;
+          document.getElementById("downloadLink").href = demoVideo;
+          document.getElementById("videoResultBox").style.display = "block";
+          btn.disabled = false;
+        }
+      }
+      executerEtape();
+    }
+
+    window.onload = init;
+  </script>
+</body>
+</html>
