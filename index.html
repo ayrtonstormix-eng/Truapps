@@ -1,0 +1,627 @@
+"""
+Truapps - backend FastAPI v2 (route A : services par API, sans GPU, sans simulation)
+
+Pipeline d'un job :
+1. moderation : filtre des contenus interdits
+2. voix : ElevenLabs (mp3)
+3. video : Kling (clips courts, envoi puis attente) + FFmpeg (assemblage, voix, mention IA)
+4. stockage : Supabase Storage (bucket privé, lien signé temporaire)
+5. monday : un élément par vidéo dans votre tableau (optionnel)
+
+Règles : aucune URL de repli, aucun faux succès. Le débit (MRCU / essai) n'a lieu qu'après
+stockage réussi de la vidéo. Un seul job à la fois par utilisateur.
+
+Prérequis système : ffmpeg et ffprobe installés (voir Dockerfile).
+Lancement : uvicorn server:app --host 0.0.0.0 --port 8000
+"""
+import os, re, json, hmac, hashlib, secrets, smtplib, sqlite3, time, uuid, shutil, subprocess, tempfile, math
+from email.message import EmailMessage
+from typing import Optional
+
+import jwt
+import requests
+from dotenv import load_dotenv
+from fastapi import FastAPI, HTTPException, Depends, BackgroundTasks, Header
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+
+load_dotenv()
+
+---------- Configuration (fichier .env du serveur uniquement) ----------
+SECRET_KEY = os.getenv("SECRET_KEY")
+if not SECRET_KEY or len(SECRET_KEY) < 32:
+raise RuntimeError("SECRET_KEY manquante ou trop courte (32 caractères minimum) dans .env")
+
+DB_PATH = os.getenv("DB_PATH", "truapps.db")
+OWNER_EMAILS = [e.strip() for e in os.getenv("OWNER_EMAILS", "").split(",") if e.strip()]
+ALLOWED_ORIGINS = [o.strip() for o in os.getenv("ALLOWED_ORIGINS", "").split(",") if o.strip()]
+TRIAL_DAYS = int(os.getenv("TRIAL_DAYS", "7"))
+TRIAL_VIDEOS = int(os.getenv("TRIAL_VIDEOS", "2"))
+TRIAL_MAX_SECONDS = int(os.getenv("TRIAL_MAX_SECONDS", "30")) # essai : vidéos très courtes (coût)
+MAX_VIDEO_SECONDS = int(os.getenv("MAX_VIDEO_SECONDS", "120")) # plafond actuel (coût Kling)
+
+ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY", "")
+ELEVENLABS_VOICE_ID = os.getenv("ELEVENLABS_VOICE_ID", "")
+ELEVENLABS_MODEL = os.getenv("ELEVENLABS_MODEL", "eleven_multilingual_v2")
+
+KLING_ACCESS_KEY = os.getenv("KLING_ACCESS_KEY", "")
+KLING_SECRET_KEY = os.getenv("KLING_SECRET_KEY", "")
+KLING_BASE = "https://api.klingai.com/v1"
+KLING_MODEL = os.getenv("KLING_MODEL", "") # à vérifier dans la doc Kling
+KLING_CLIP_SECONDS = int(os.getenv("KLING_CLIP_SECONDS", "10")) # durée d'un clip (5 ou 10, à vérifier)
+KLING_TIMEOUT = int(os.getenv("KLING_TIMEOUT", "1500")) # 25 minutes max d'attente
+
+SUPABASE_URL = os.getenv("SUPABASE_URL", "").rstrip("/")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY", "") # clé service_role : serveur uniquement
+SUPABASE_BUCKET = os.getenv("SUPABASE_BUCKET", "videos") # bucket PRIVÉ
+
+MONDAY_API_KEY = os.getenv("MONDAY_API_KEY", "")
+MONDAY_BOARD_ID = os.getenv("MONDAY_BOARD_ID", "")
+MONDAY_API_URL = "https://api.monday.com/v2"
+
+SMTP_HOST = os.getenv("SMTP_HOST", "")
+SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
+SMTP_USER = os.getenv("SMTP_USER", "")
+SMTP_PASS = os.getenv("SMTP_PASS", "")
+DEV_MODE = os.getenv("DEV_MODE", "0") == "1"
+FONT_PATH = os.getenv("FONT_PATH", "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf")
+
+STYLES_VISUELS = {
+"Reel 4K": "Photorealistic 4K camera shot, highly detailed skin pores, cinematic 35mm lens lighting, masterfully graded, lifelike",
+"3D Pixar": "3D Pixar style animation, soft organic shapes, vibrant volumetric 3D lighting, expressive eyes",
+"Crayon": "Pencil sketch style, graphite line art, charcoal shading, visible artistic paper texture, hand-drawn",
+"Cartoon 2D": "Simple 2D vector cartoon, clean minimalist line art, flat solid colors, sharp cell shading, modern animation",
+}
+FORMATS_PRODUCTION = {
+"Cinematique": "Cinematic composition, dramatic atmospheric lighting, ultra-wide establishing shots, slow camera tracking",
+"Publicitaire": "Commercial ad format, dynamic camera cuts, punchy energetic marketing contrast, vibrant studio lighting",
+"Live": "Live presentation format, direct face-to-camera studio setup, crisp interview lighting, presenter desk",
+"Cours": "Educational course layout, clean pedagogical visual clarity, professional documentary composition",
+"Formation": "Corporate training structure, formal professional corporate setting, structured clean aesthetics",
+}
+PROMPT_REALISME_PARFAIT = (
+"Ultra-photorealistic 4K camera shot, lifelike rendering, hyper-detailed skin pores, realistic eyes, "
+"cinematic 35mm lens lighting, masterfully color-graded, real-world physics"
+)
+REALISMES = {"Realisme parfait", "Semi-IA", "IA pure"}
+LANGUES = {"fr", "en", "ar", "es", "zh", "pt", "de", "ru", "ja", "hi", "it", "ko", "tr", "vi", "id", "pl", "nl", "th", "fa", "sw"}
+MOTS_INTERDITS = re.compile(r"\b(porn\w*|nu(?:de|dité)s?|sexe explicite|xxx)\b", re.IGNORECASE)
+
+app = FastAPI(title="Truapps API")
+app.add_middleware(
+CORSMiddleware,
+allow_origins=ALLOWED_ORIGINS,
+allow_methods=["GET", "POST"],
+allow_headers=["Authorization", "Content-Type"],
+)
+
+
+---------- Base de données ----------
+def db():
+c = sqlite3.connect(DB_PATH)
+c.row_factory = sqlite3.Row
+return c
+
+
+def init_db():
+with db() as c:
+c.executescript("""
+CREATE TABLE IF NOT EXISTS users(
+id TEXT PRIMARY KEY, email TEXT NOT NULL, email_norm TEXT NOT NULL UNIQUE,
+phone_hash TEXT NOT NULL UNIQUE, created_at INTEGER NOT NULL, trial_end INTEGER NOT NULL,
+trial_used INTEGER NOT NULL DEFAULT 0, mrcu INTEGER NOT NULL DEFAULT 0,
+plan TEXT NOT NULL DEFAULT 'essai', banned INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS otps(
+email_norm TEXT PRIMARY KEY, code_hash TEXT NOT NULL, expires INTEGER NOT NULL,
+created INTEGER NOT NULL, attempts INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS jobs(
+id TEXT PRIMARY KEY, user_id TEXT NOT NULL, status TEXT NOT NULL, steps TEXT NOT NULL,
+result TEXT, created_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+""")
+# Un job resté « en_cours » après un redémarrage du serveur est forcément mort
+c.execute("UPDATE jobs SET status='echec' WHERE status='en_cours'")
+
+
+init_db()
+
+
+---------- Outils ----------
+def normaliser_email(e: str) -> str:
+e = e.strip().lower()
+local, _, dom = e.partition("@")
+if dom in ("gmail.com", "googlemail.com"):
+local = local.split("+")[0].replace(".", "")
+dom = "gmail.com"
+return f"{local}@{dom}"
+
+
+OWNERS_NORM = {normaliser_email(e) for e in OWNER_EMAILS}
+EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+.[^@\s]+$`")
+
+
+def hmac_hex(valeur: str) -> str:
+return hmac.new(SECRET_KEY.encode(), valeur.encode(), hashlib.sha256).hexdigest()
+
+
+def est_proprietaire(user) -> bool:
+return user["email_norm"] in OWNERS_NORM
+
+
+def kill_switch_actif() -> bool:
+with db() as c:
+r = c.execute("SELECT value FROM settings WHERE key='killswitch'").fetchone()
+return bool(r) and r["value"] == "1"
+
+
+def envoyer_code_email(destinataire: str, code: str):
+if not SMTP_HOST:
+if DEV_MODE:
+print(f"[DEV] Code de connexion pour {destinataire} : {code}")
+return
+raise HTTPException(503, "Envoi d'email non configuré sur le serveur.")
+msg = EmailMessage()
+msg["Subject"] = "Votre code de connexion Truapps"
+msg["From"] = SMTP_USER
+msg["To"] = destinataire
+msg.set_content(f"Votre code Truapps : {code}\nIl expire dans 10 minutes.")
+with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=20) as s:
+s.starttls()
+s.login(SMTP_USER, SMTP_PASS)
+s.send_message(msg)
+
+
+def creer_token(user_id: str) -> str:
+return jwt.encode({"sub": user_id, "exp": int(time.time()) + 7 * 86400}, SECRET_KEY, algorithm="HS256")
+
+
+def utilisateur_courant(authorization: Optional[str] = Header(None)):
+if not authorization or not authorization.startswith("Bearer "):
+raise HTTPException(401, "Connexion requise.")
+try:
+payload = jwt.decode(authorization[7:], SECRET_KEY, algorithms=["HS256"])
+except jwt.PyJWTError:
+raise HTTPException(401, "Session expirée, reconnectez-vous.")
+with db() as c:
+user = c.execute("SELECT * FROM users WHERE id=?", (payload["sub"],)).fetchone()
+if not user:
+raise HTTPException(401, "Compte introuvable.")
+if user["banned"]:
+raise HTTPException(403, "Compte suspendu.")
+if kill_switch_actif() and not est_proprietaire(user):
+raise HTTPException(503, "Truapps est en maintenance.")
+return user
+
+
+---------- Authentification ----------
+class DemandeCode(BaseModel):
+email: str
+
+
+class VerifCode(BaseModel):
+email: str
+code: str
+telephone: Optional[str] = None # obligatoire à la première inscription
+
+
+@app.post("/auth/request-code")
+def demander_code(d: DemandeCode):
+if not EMAIL_RE.match(d.email.strip()):
+raise HTTPException(400, "Email invalide.")
+norm = normaliser_email(d.email)
+now = int(time.time())
+with db() as c:
+ancien = c.execute("SELECT created FROM otps WHERE email_norm=?", (norm,)).fetchone()
+if ancien and now - ancien["created"] < 60:
+raise HTTPException(429, "Patientez une minute avant de redemander un code.")
+code = f"{secrets.randbelow(1_000_000):06d}"
+c.execute("REPLACE INTO otps(email_norm, code_hash, expires, created, attempts) VALUES(?,?,?,?,0)",
+(norm, hmac_hex(code), now + 600, now))
+envoyer_code_email(d.email.strip(), code)
+return {"status": "sent"}
+
+
+@app.post("/auth/verify")
+def verifier_code(d: VerifCode):
+norm = normaliser_email(d.email)
+now = int(time.time())
+with db() as c:
+otp = c.execute("SELECT * FROM otps WHERE email_norm=?", (norm,)).fetchone()
+if not otp or otp["expires"] < now:
+raise HTTPException(400, "Code expiré ou inexistant.")
+if otp["attempts"] >= 5:
+raise HTTPException(429, "Trop d'essais, redemandez un code.")
+if not hmac.compare_digest(otp["code_hash"], hmac_hex(d.code.strip())):
+c.execute("UPDATE otps SET attempts=attempts+1 WHERE email_norm=?", (norm,))
+raise HTTPException(400, "Code incorrect.")
+c.execute("DELETE FROM otps WHERE email_norm=?", (norm,))
+
+user = c.execute("SELECT * FROM users WHERE email_norm=?", (norm,)).fetchone()
+if not user:
+chiffres = re.sub(r"\D", "", d.telephone or "")
+if len(chiffres) < 8:
+raise HTTPException(400, "Numéro de téléphone requis pour l'inscription.")
+uid = str(uuid.uuid4())
+try:
+c.execute(
+"INSERT INTO users(id,email,email_norm,phone_hash,created_at,trial_end,mrcu) VALUES(?,?,?,?,?,?,0)",
+(uid, d.email.strip(), norm, hmac_hex(chiffres), now, now + TRIAL_DAYS * 86400),
+)
+except sqlite3.IntegrityError:
+raise HTTPException(409, "Un essai gratuit existe déjà pour cet email ou ce numéro.")
+user = c.execute("SELECT * FROM users WHERE id=?", (uid,)).fetchone()
+return {"token": creer_token(user["id"]), "role": "proprietaire" if est_proprietaire(user) else "client"}
+
+
+@app.get("/me")
+def moi(user=Depends(utilisateur_courant)):
+now = int(time.time())
+return {
+"email": user["email"],
+"role": "proprietaire" if est_proprietaire(user) else "client",
+"mrcu": None if est_proprietaire(user) else user["mrcu"],
+"essai_jours_restants": max(0, (user["trial_end"] - now) // 86400),
+"essai_videos_restantes": max(0, TRIAL_VIDEOS - user["trial_used"]),
+"duree_max_secondes": MAX_VIDEO_SECONDS,
+"duree_max_essai_secondes": TRIAL_MAX_SECONDS,
+}
+
+
+---------- Droits et quotas ----------
+def determiner_mode(user, duree: int) -> str:
+if est_proprietaire(user):
+return "proprietaire"
+if user["mrcu"] >= 1:
+return "paye"
+if int(time.time()) < user["trial_end"] and user["trial_used"] < TRIAL_VIDEOS:
+if duree > TRIAL_MAX_SECONDS:
+raise HTTPException(403, f"L'essai gratuit est limité à {TRIAL_MAX_SECONDS} secondes par vidéo.")
+return "essai"
+raise HTTPException(402, "Essai terminé ou MRCU épuisés. Abonnement requis.")
+
+
+def debiter(user_id: str, mode: str) -> bool:
+with db() as c:
+if mode == "paye":
+r = c.execute("UPDATE users SET mrcu=mrcu-1 WHERE id=? AND mrcu>=1", (user_id,))
+elif mode == "essai":
+r = c.execute("UPDATE users SET trial_used=trial_used+1 WHERE id=? AND trial_used<?", (user_id, TRIAL_VIDEOS))
+else:
+return True
+return r.rowcount == 1
+
+
+---------- Étapes du pipeline ----------
+class EtapeNonConfiguree(Exception):
+pass
+
+
+def lancer(cmd: list) -> str:
+r = subprocess.run(cmd, capture_output=True, text=True, timeout=1800)
+if r.returncode != 0:
+raise RuntimeError(f"{cmd[0]} a échoué : {r.stderr[-300:]}")
+return r.stdout
+
+
+def duree_media(chemin: str) -> float:
+out = lancer(["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", chemin])
+return float(out.strip())
+
+
+def etape_voix(texte: str, dossier: str) -> str:
+if not (ELEVENLABS_API_KEY and ELEVENLABS_VOICE_ID):
+raise EtapeNonConfiguree("ElevenLabs non configuré (clé ou ID de voix absent).")
+r = requests.post(
+f"https://api.elevenlabs.io/v1/text-to-speech/{ELEVENLABS_VOICE_ID}",
+params={"output_format": "mp3_44100_128"},
+json={"text": texte, "model_id": ELEVENLABS_MODEL},
+headers={"xi-api-key": ELEVENLABS_API_KEY, "Content-Type": "application/json"},
+timeout=300,
+)
+if r.status_code != 200:
+raise RuntimeError(f"ElevenLabs HTTP {r.status_code}: {r.text[:150]}")
+chemin = os.path.join(dossier, "voix.mp3")
+with open(chemin, "wb") as f:
+f.write(r.content)
+return chemin
+
+
+def kling_headers() -> dict:
+now = int(time.time())
+token = jwt.encode({"iss": KLING_ACCESS_KEY, "exp": now + 1800, "nbf": now - 5}, KLING_SECRET_KEY,
+algorithm="HS256", headers={"alg": "HS256", "typ": "JWT"})
+return {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+
+
+def kling_envoyer(prompt: str, mode: str) -> str:
+body = {"prompt": prompt[:2000], "duration": str(KLING_CLIP_SECONDS), "mode": mode, "aspect_ratio": "16:9"}
+if KLING_MODEL:
+body["model_name"] = KLING_MODEL
+r = requests.post(f"{KLING_BASE}/videos/text2video", json=body, headers=kling_headers(), timeout=60)
+r.raise_for_status()
+j = r.json()
+if j.get("code") != 0:
+raise RuntimeError(f"Kling : {str(j.get('message'))[:150]}")
+return j["data"]["task_id"]
+
+
+def kling_attendre(task_ids: list) -> list:
+urls, debut = {}, time.time()
+while len(urls) < len(task_ids):
+if time.time() - debut > KLING_TIMEOUT:
+raise RuntimeError("Kling : délai d'attente dépassé.")
+for tid in task_ids:
+if tid in urls:
+continue
+r = requests.get(f"{KLING_BASE}/videos/text2video/{tid}", headers=kling_headers(), timeout=30)
+r.raise_for_status()
+d = r.json().get("data") or {}
+statut = d.get("task_status")
+if statut == "succeed":
+urls[tid] = d["task_result"]["videos"][0]["url"]
+elif statut == "failed":
+raise RuntimeError(f"Kling : clip refusé ({str(d.get('task_status_msg', ''))[:120]})")
+if len(urls) < len(task_ids):
+time.sleep(10)
+return [urls[t] for t in task_ids]
+
+
+def decouper_scenes(texte: str, n: int) -> list:
+mots = texte.split()
+taille = max(1, math.ceil(len(mots) / n))
+morceaux = [" ".join(mots[i:i + taille]) for i in range(0, len(mots), taille)]
+while len(morceaux) < n:
+morceaux.append(morceaux[-1])
+return morceaux[:n]
+
+
+def etape_video(data: dict, dossier: str, audio: str, duree_audio: float) -> str:
+if not (KLING_ACCESS_KEY and KLING_SECRET_KEY):
+raise EtapeNonConfiguree("Kling non configuré (clé d'accès ou clé secrète absente).")
+nb_clips = max(1, math.ceil(duree_audio / KLING_CLIP_SECONDS))
+parfait = data["realisme"] == "Realisme parfait" or data["style"] == "Reel 4K"
+style = PROMPT_REALISME_PARFAIT if parfait else STYLES_VISUELS[data["style"]]
+mode = "pro" if parfait else "std"
+fmt = FORMATS_PRODUCTION[data["format"]]
+scenes = decouper_scenes(data["texte"], nb_clips)
+ids = [kling_envoyer(f"{style}. {fmt}. Scene: {s}", mode) for s in scenes]
+urls = kling_attendre(ids)
+
+clips = []
+for i, url in enumerate(urls):
+chemin = os.path.join(dossier, f"clip{i}.mp4")
+with requests.get(url, stream=True, timeout=300) as r:
+r.raise_for_status()
+with open(chemin, "wb") as f:
+for bloc in r.iter_content(1 << 20):
+f.write(bloc)
+clips.append(chemin)
+
+liste = os.path.join(dossier, "liste.txt")
+with open(liste, "w") as f:
+f.write("".join(f"file '{c}'\n" for c in clips))
+final = os.path.join(dossier, "final.mp4")
+police = f":fontfile={FONT_PATH}" if os.path.exists(FONT_PATH) else ""
+filtre = (f"drawtext=text='Généré par assistance IA'{police}:fontcolor=white@0.7:"
+f"fontsize=h/45:x=w-tw-20:y=h-th-20")
+lancer(["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", liste, "-i", audio,
+"-map", "0:v", "-map", "1:a", "-vf", filtre,
+"-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p",
+"-c:a", "aac", "-shortest", final])
+return final
+
+
+def supabase_headers() -> dict:
+return {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}
+
+
+def etape_stockage(job_id: str, user_id: str, fichier: str) -> str:
+if not (SUPABASE_URL and SUPABASE_KEY):
+raise EtapeNonConfiguree("Supabase non configuré (URL ou clé absente).")
+chemin = f"{user_id}/{job_id}.mp4"
+with open(fichier, "rb") as f:
+r = requests.post(f"{SUPABASE_URL}/storage/v1/object/{SUPABASE_BUCKET}/{chemin}",
+data=f, headers={**supabase_headers(), "Content-Type": "video/mp4"}, timeout=600)
+if r.status_code not in (200, 201):
+raise RuntimeError(f"Supabase HTTP {r.status_code}: {r.text[:150]}")
+return chemin
+
+
+def url_signee(chemin: str) -> str:
+r = requests.post(f"{SUPABASE_URL}/storage/v1/object/sign/{SUPABASE_BUCKET}/{chemin}",
+json={"expiresIn": 86400}, headers=supabase_headers(), timeout=30)
+r.raise_for_status()
+j = r.json()
+lien = j.get("signedURL") or j.get("signedUrl")
+if not lien:
+raise RuntimeError("Supabase n'a renvoyé aucun lien signé.")
+return f"{SUPABASE_URL}/storage/v1{lien}"
+
+
+def etape_monday(job_id: str, data: dict):
+if not (MONDAY_API_KEY and MONDAY_BOARD_ID):
+raise EtapeNonConfiguree("monday.com non configuré (clé ou tableau absent).")
+query = """
+mutation ($board: ID!, $name: String!) {
+create_item(board_id: `$board, item_name: $name) { id }
+}"""
+r = requests.post(MONDAY_API_URL,
+json={"query": query, "variables": {"board": MONDAY_BOARD_ID, "name": f"Vidéo {job_id[:8]} - {data['format']}"}},
+headers={"Authorization": MONDAY_API_KEY, "Content-Type": "application/json"}, timeout=30)
+r.raise_for_status()
+if "errors" in r.json():
+raise RuntimeError(str(r.json()["errors"])[:200])
+
+
+---------- Orchestrateur de jobs ----------
+class DemandeContenu(BaseModel):
+texte: str
+style: str = "Reel 4K"
+format: str = "Cinematique"
+realisme: str = "Semi-IA"
+langue: str = "fr"
+duree: int = 15
+
+
+ETAPES = ("moderation", "voix", "video", "stockage", "monday")
+
+
+def maj_job(job_id: str, step: Optional[str], statut: str = "", detail: str = "",
+status_global: Optional[str] = None, result: Optional[dict] = None):
+with db() as c:
+row = c.execute("SELECT steps FROM jobs WHERE id=?", (job_id,)).fetchone()
+steps = json.loads(row["steps"])
+for s in steps:
+if s["nom"] == step:
+s["statut"], s["detail"] = statut, detail
+c.execute("UPDATE jobs SET steps=?, status=COALESCE(?,status), result=COALESCE(?,result) WHERE id=?",
+(json.dumps(steps), status_global, json.dumps(result) if result else None, job_id))
+
+
+def executer_job(job_id: str, user_id: str, mode: str, data: dict):
+dossier = tempfile.mkdtemp(prefix=f"truapps_{job_id[:8]}_")
+etape = "moderation"
+try:
+if MOTS_INTERDITS.search(data["texte"]):
+maj_job(job_id, "moderation", "echec", "Contenu interdit détecté.", "echec")
+return
+maj_job(job_id, "moderation", "ok")
+
+etape = "voix"
+maj_job(job_id, "voix", "en_cours")
+audio = etape_voix(data["texte"], dossier)
+duree_audio = duree_media(audio)
+plafond = TRIAL_MAX_SECONDS if mode == "essai" else MAX_VIDEO_SECONDS
+if duree_audio > plafond:
+maj_job(job_id, "voix", "echec",
+f"La voix dure {int(duree_audio)} s, le maximum actuel est {plafond} s. Raccourcissez le texte.", "echec")
+return
+maj_job(job_id, "voix", "ok", f"{int(duree_audio)} s")
+
+etape = "video"
+maj_job(job_id, "video", "en_cours", "Kling travaille, cela peut prendre plusieurs minutes.")
+final = etape_video(data, dossier, audio, duree_audio)
+maj_job(job_id, "video", "ok")
+
+etape = "stockage"
+maj_job(job_id, "stockage", "en_cours")
+chemin = etape_stockage(job_id, user_id, final)
+if not debiter(user_id, mode):
+maj_job(job_id, "stockage", "echec", "Quota épuisé pendant la génération.", "echec")
+return
+maj_job(job_id, "stockage", "ok", result={"storage_path": chemin})
+
+try:
+etape_monday(job_id, data)
+maj_job(job_id, "monday", "ok")
+except EtapeNonConfiguree as e:
+maj_job(job_id, "monday", "non_configure", str(e))
+except Exception as e:
+maj_job(job_id, "monday", "echec", f"{type(e).name}: {str(e)[:200]}")
+
+maj_job(job_id, None, status_global="termine")
+except EtapeNonConfiguree as e:
+maj_job(job_id, etape, "non_configure", str(e), "echec")
+except Exception as e:
+maj_job(job_id, etape, "echec", f"{type(e).name}: {str(e)[:250]}", "echec")
+finally:
+shutil.rmtree(dossier, ignore_errors=True)
+
+
+@app.post("/api/generer-contenu")
+def generer_contenu(d: DemandeContenu, bg: BackgroundTasks, user=Depends(utilisateur_courant)):
+if not d.texte.strip() or len(d.texte) > 20000:
+raise HTTPException(400, "Texte vide ou trop long.")
+if d.style not in STYLES_VISUELS or d.format not in FORMATS_PRODUCTION or d.realisme not in REALISMES or d.langue not in LANGUES:
+raise HTTPException(400, "Option invalide.")
+if not 15 <= d.duree <= MAX_VIDEO_SECONDS:
+raise HTTPException(400, f"Durée entre 15 et {MAX_VIDEO_SECONDS} secondes pour le moment.")
+if d.realisme == "Realisme parfait" and d.format != "Cinematique":
+raise HTTPException(400, "Le réalisme parfait est réservé au format Cinématique.")
+
+mode = determiner_mode(user, d.duree)
+with db() as c:
+if c.execute("SELECT 1 FROM jobs WHERE user_id=? AND status='en_cours'", (user["id"],)).fetchone():
+raise HTTPException(429, "Une vidéo est déjà en cours de création pour votre compte.")
+job_id = str(uuid.uuid4())
+steps = [{"nom": n, "statut": "attente", "detail": ""} for n in ETAPES]
+c.execute("INSERT INTO jobs(id,user_id,status,steps,created_at) VALUES(?,?,?,?,?)",
+(job_id, user["id"], "en_cours", json.dumps(steps), int(time.time())))
+bg.add_task(executer_job, job_id, user["id"], mode, d.model_dump())
+return {"status": "accepted", "job_id": job_id}
+
+
+@app.get("/api/jobs/{job_id}")
+def lire_job(job_id: str, user=Depends(utilisateur_courant)):
+with db() as c:
+j = c.execute("SELECT * FROM jobs WHERE id=? AND user_id=?", (job_id, user["id"])).fetchone()
+if not j:
+raise HTTPException(404, "Job introuvable.")
+result = json.loads(j["result"]) if j["result"] else None
+video_url = None
+if j["status"] == "termine" and result and result.get("storage_path"):
+try:
+video_url = url_signee(result["storage_path"]) # lien frais à chaque lecture (24 h)
+except Exception:
+video_url = None
+return {"job_id": j["id"], "status": j["status"], "steps": json.loads(j["steps"]), "video_url": video_url}
+
+
+---------- Administration (propriétaire uniquement, vérifié côté serveur) ----------
+class KillSwitch(BaseModel):
+actif: bool
+
+
+@app.post("/admin/killswitch")
+def killswitch(d: KillSwitch, user=Depends(utilisateur_courant)):
+if not est_proprietaire(user):
+raise HTTPException(403, "Réservé au propriétaire.")
+with db() as c:
+c.execute("REPLACE INTO settings(key,value) VALUES('killswitch',?)", ("1" if d.actif else "0",))
+return {"killswitch": d.actif}
+
+
+@app.get("/health")
+def health():
+return {
+"ok": True,
+"voix_elevenlabs": bool(ELEVENLABS_API_KEY and ELEVENLABS_VOICE_ID),
+"video_kling": bool(KLING_ACCESS_KEY and KLING_SECRET_KEY),
+"stockage_supabase": bool(SUPABASE_URL and SUPABASE_KEY),
+"monday": bool(MONDAY_API_KEY and MONDAY_BOARD_ID),
+"ffmpeg": bool(shutil.which("ffmpeg") and shutil.which("ffprobe")),
+}
+package 68 mo;
+
+import android.app.Activity;
+import android.os.Bundle;
+
+public class MainActivity extends Activity {
+
+@Override
+protected void onCreate(Bundle savedInstanceState)super.onCreate(savedInstanceState);
+}
+
+}
+package 68 mo;
+
+import android.app.Activity;
+import android.os.Bundle;
+
+public class MainActivity extends Activity {
+
+@Override
+protected void onCreate(Bundle savedInstanceState)super.onCreate(savedInstanceState);
+}
+
+}
+fastapi
+uvicorn
+python-dotenv
+requests
+PyJWT
+pydantic
+
